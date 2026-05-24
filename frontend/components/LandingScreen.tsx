@@ -1,6 +1,7 @@
 "use client";
 // CommunityPulse V2 — Landing Screen
 // V2 Changes: community cards show member_stake so users know cost before joining
+// UI Fix: removed stat-chips section (AI Judge / 1 Address = 1 Vote / etc)
 
 import { useState, useEffect } from "react";
 import { Screen } from "../types";
@@ -23,7 +24,7 @@ interface RecentCommunity {
   member_count: number;
   pot_balance: number;
   funded_count: number;
-  member_stake: number;  // V2 NEW
+  member_stake: number;
   status: string;
 }
 
@@ -91,19 +92,6 @@ export default function LandingScreen({
             On-chain community treasury governed by AI.<br />
             Pool funds. Write a constitution. Let the AI decide.
           </p>
-          <div className="stat-chips">
-            {[
-              ["AI",  "Judge"],
-              ["1",   "Address = 1 Vote"],
-              ["0",   "Whale Power"],
-              ["USDC","Sybil Resistance"],
-            ].map(([n, l]) => (
-              <div key={l} className="stat-chip">
-                <span className="num">{n}</span>
-                <span className="lbl">{l}</span>
-              </div>
-            ))}
-          </div>
         </div>
       </div>
 
@@ -250,7 +238,6 @@ export default function LandingScreen({
                       <span>👥 {c.member_count} members</span>
                       <span>💰 {c.pot_balance} pot</span>
                       <span>✅ {c.funded_count} funded</span>
-                      {/* V2 NEW: show stake requirement */}
                       <span style={{ color: c.member_stake > 0 ? "#A78BFA" : "#555566" }}>
                         {c.member_stake > 0 ? `🔒 ${c.member_stake} USDC to join` : "🔓 Free to join"}
                       </span>
