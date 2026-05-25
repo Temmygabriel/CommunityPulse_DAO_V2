@@ -1,6 +1,7 @@
 // CommunityPulse V2 — ARC Contract Utils
 // All ARC interaction goes through this file.
 // Uses ethers.js v6.
+// Fix: normaliseKey() added to handle genlayer-js returning non-hex private keys
 
 import { ethers } from "ethers";
 
@@ -14,18 +15,14 @@ const RELAY_KEY       = process.env.NEXT_PUBLIC_RELAY_PRIVATE_KEY as string;
 // ── ABIs ─────────────────────────────────────────────────────────────────────
 
 const ESCROW_ABI = [
-  // Write — member-initiated
   "function depositStake(string communityId, address member, uint256 amount) external",
-  // Write — relay-only
   "function releaseStake(string communityId, address member) external",
   "function slashStake(string communityId, address member) external",
   "function registerCommunity(string communityId, address potAddress) external",
-  // View
   "function getStake(string communityId, address member) external view returns (uint256)",
   "function getPotAddress(string communityId) external view returns (address)",
   "function relay() external view returns (address)",
   "function owner() external view returns (address)",
-  // Events
   "event StakeDeposited(string communityId, address indexed member, uint256 amount)",
   "event StakeReleased(string communityId, address indexed member, uint256 amount)",
   "event StakeSlashed(string communityId, address indexed member, uint256 amount, address indexed pot)",
@@ -39,9 +36,44 @@ const USDC_ABI = [
   "function decimals() external view returns (uint8)",
 ];
 
-// ── USDC decimal constant (ARC USDC = 6 decimals, same as mainnet) ────────────
-
 const USDC_DECIMALS = 6;
+
+// ── Key normalisation ─────────────────────────────────────────────────────────
+// genlayer-js v0.23.0 may return privateKey as Uint8Array, array-like, or a
+// plain hex string. ethers.js v6 requires a 0x-prefixed 32-byte hex string.
+// This converts any of those formats into what ethers.js expects.
+
+function normaliseKey(key: string | Uint8Array | number[] | any): string {
+  // Already a clean 0x hex string
+  if (typeof key === "string" && key.startsWith("0x") && key.length === 66) {
+    return key;
+  }
+
+  // String without 0x prefix (64 hex chars)
+  if (typeof key === "string" && key.length === 64) {
+    return "0x" + key;
+  }
+
+  // String that is JSON-serialised array e.g. "[1,2,3,...]"
+  if (typeof key === "string" && key.startsWith("[")) {
+    try {
+      const arr = JSON.parse(key);
+      const bytes = new Uint8Array(arr);
+      return "0x" + Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+    } catch {
+      // fall through
+    }
+  }
+
+  // Uint8Array or plain number array
+  if (key instanceof Uint8Array || Array.isArray(key)) {
+    const bytes = new Uint8Array(key);
+    return "0x" + Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  // Last resort
+  return typeof key === "string" && key.startsWith("0x") ? key : "0x" + key;
+}
 
 // ── Provider / Signer factories ───────────────────────────────────────────────
 
@@ -49,29 +81,22 @@ export function makeArcProvider(): ethers.JsonRpcProvider {
   return new ethers.JsonRpcProvider(ARC_RPC);
 }
 
-/// Relay signer — used for releaseStake, slashStake, registerCommunity
-/// WARNING: RELAY_KEY is in env — acceptable for testnet browser usage.
-/// Never expose in production.
 export function makeRelaySigner(): ethers.Wallet {
   const provider = makeArcProvider();
-  return new ethers.Wallet(RELAY_KEY, provider);
+  return new ethers.Wallet(normaliseKey(RELAY_KEY), provider);
 }
 
-/// Member signer — used for approve + depositStake.
-/// @param privateKey  The member's wallet private key (from localStorage cp_private_key).
 export function makeMemberSigner(privateKey: string): ethers.Wallet {
   const provider = makeArcProvider();
-  return new ethers.Wallet(privateKey, provider);
+  return new ethers.Wallet(normaliseKey(privateKey), provider);
 }
 
-/// Derive the relay wallet address from RELAY_KEY (used to set potAddress on create).
 export function getRelayAddress(): string {
-  return new ethers.Wallet(RELAY_KEY).address;
+  return new ethers.Wallet(normaliseKey(RELAY_KEY)).address;
 }
 
 // ── Balance checks ────────────────────────────────────────────────────────────
 
-/// USDC balance in whole units (e.g. 2.5 USDC returns 2.5).
 export async function getUsdcBalance(address: string): Promise<number> {
   const provider = makeArcProvider();
   const usdc = new ethers.Contract(USDC_ADDRESS, USDC_ABI, provider);
@@ -79,13 +104,10 @@ export async function getUsdcBalance(address: string): Promise<number> {
   return Number(ethers.formatUnits(raw, USDC_DECIMALS));
 }
 
-/// Relay wallet USDC balance — used for health check on dashboard.
-/// Displays a warning if below 1 USDC so demo doesn't stall.
 export async function getRelayBalance(): Promise<number> {
   return getUsdcBalance(getRelayAddress());
 }
 
-/// Read current escrow stake for a member (in whole USDC units).
 export async function getStakeBalance(
   communityId: string,
   memberAddress: string
@@ -98,10 +120,6 @@ export async function getStakeBalance(
 
 // ── Member-initiated calls ─────────────────────────────────────────────────────
 
-/// Step 1a of the join flow: member approves the escrow contract to spend USDC.
-/// @param memberPrivateKey  From localStorage cp_private_key
-/// @param amountUsdc        Whole USDC (e.g. 2 for 2 USDC)
-/// @returns approve tx hash
 export async function approveUsdc(
   memberPrivateKey: string,
   amountUsdc: number
@@ -114,13 +132,6 @@ export async function approveUsdc(
   return tx.hash as string;
 }
 
-/// Step 1b of the join flow: member deposits stake.
-/// Must have called approveUsdc first.
-/// @param memberPrivateKey  From localStorage cp_private_key
-/// @param communityId       GenLayer community ID e.g. "COM000001"
-/// @param memberAddress     Member's wallet address
-/// @param amountUsdc        Whole USDC (must match community member_stake)
-/// @returns deposit tx hash — STORE IN LOCALSTORAGE IMMEDIATELY as proof for GenLayer
 export async function depositStake(
   memberPrivateKey: string,
   communityId: string,
@@ -137,11 +148,6 @@ export async function depositStake(
 
 // ── Relay-only calls ──────────────────────────────────────────────────────────
 
-/// Called after GenLayer create_community succeeds.
-/// Registers relay wallet as the community's slash destination.
-/// @param communityId  GenLayer community ID e.g. "COM000001"
-/// @param potAddress   Address to receive slashed stakes (use relay wallet on testnet)
-/// @returns registerCommunity tx hash
 export async function registerCommunity(
   communityId: string,
   potAddress: string
@@ -153,11 +159,6 @@ export async function registerCommunity(
   return tx.hash as string;
 }
 
-/// Called after GenLayer leave_community returns true.
-/// Returns staked USDC to the member's wallet.
-/// @param communityId    GenLayer community ID
-/// @param memberAddress  Member wallet address
-/// @returns releaseStake tx hash
 export async function releaseStake(
   communityId: string,
   memberAddress: string
@@ -169,11 +170,6 @@ export async function releaseStake(
   return tx.hash as string;
 }
 
-/// Called after GenLayer slash_member returns true.
-/// Sends staked USDC to the community pot address (relay wallet on testnet).
-/// @param communityId    GenLayer community ID
-/// @param memberAddress  Address of slashed member
-/// @returns slashStake tx hash
 export async function slashStake(
   communityId: string,
   memberAddress: string

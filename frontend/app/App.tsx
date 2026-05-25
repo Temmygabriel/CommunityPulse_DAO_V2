@@ -1,12 +1,6 @@
 "use client";
 // CommunityPulse V2 — Main Orchestrator
-// V2 Changes:
-//   - handleCreateCommunity: memberStake param + registerCommunity on ARC after GenLayer success
-//   - handleJoinCommunity: receives arcTxHash from JoinCommunityScreen, clears localStorage on success
-//   - handleLeaveCommunity: GenLayer leave → ARC releaseStake (only if GenLayer returns true)
-//   - handleSlashMember:    GenLayer slash → ARC slashStake  (only if GenLayer returns true)
-//   - playerPrivateKey state passed to JoinCommunityScreen for ARC signing
-//   - All V1 handlers preserved exactly
+// Fix: normalisePrivateKey() ensures genlayer-js key is always stored as clean 0x hex string
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Screen, Community, Proposal } from "../types";
@@ -47,10 +41,46 @@ import TreasuryScreen from "../components/TreasuryScreen";
 const POLL_INTERVAL  = 3000;
 const CALC_FALLBACK  = 30_000;
 
+// ── Key normalisation ─────────────────────────────────────────────────────────
+// genlayer-js may return privateKey as Uint8Array, array-like, or string.
+// Always store and use a clean 0x hex string so ethers.js never chokes.
+function normalisePrivateKey(key: any): string {
+  if (!key) return "";
+
+  // Already a clean 0x hex string
+  if (typeof key === "string" && key.startsWith("0x") && key.length === 66) {
+    return key;
+  }
+
+  // Plain hex string without 0x
+  if (typeof key === "string" && key.length === 64) {
+    return "0x" + key;
+  }
+
+  // JSON-serialised array e.g. "[1,2,3,...]"
+  if (typeof key === "string" && key.startsWith("[")) {
+    try {
+      const arr = JSON.parse(key);
+      const bytes = new Uint8Array(arr);
+      return "0x" + Array.from(bytes).map((b: number) => b.toString(16).padStart(2, "0")).join("");
+    } catch {
+      // fall through
+    }
+  }
+
+  // Uint8Array or number array
+  if (key instanceof Uint8Array || Array.isArray(key)) {
+    const bytes = new Uint8Array(key);
+    return "0x" + Array.from(bytes).map((b: number) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  return typeof key === "string" && key.startsWith("0x") ? key : "0x" + String(key);
+}
+
 export default function App() {
   const [screen, setScreen]                   = useState<Screen>("landing");
   const [playerAddress, setPlayerAddress]     = useState("");
-  const [playerPrivateKey, setPlayerPrivateKey] = useState(""); // V2 — for ARC signing
+  const [playerPrivateKey, setPlayerPrivateKey] = useState("");
   const [playerName, setPlayerName]           = useState("");
   const [activeCommunityId, setActiveCommunityId] = useState("");
   const [activeProposalId, setActiveProposalId]   = useState("");
@@ -86,20 +116,24 @@ export default function App() {
           localStorage.removeItem("cp_address");
         }
         acc = makeAccount();
-        localStorage.setItem("cp_private_key", acc.privateKey);
+        // FIXED: normalise before storing
+        const cleanKey = normalisePrivateKey(acc.privateKey);
+        localStorage.setItem("cp_private_key", cleanKey);
       }
     } catch {
       localStorage.removeItem("cp_private_key");
       localStorage.removeItem("cp_address");
       localStorage.removeItem("cp_name");
       acc = makeAccount();
-      localStorage.setItem("cp_private_key", acc.privateKey);
+      const cleanKey = normalisePrivateKey(acc.privateKey);
+      localStorage.setItem("cp_private_key", cleanKey);
     }
 
     accountRef.current = acc;
     localStorage.setItem("cp_address", acc.address);
     setPlayerAddress(acc.address);
-    setPlayerPrivateKey(acc.privateKey); // V2 — expose for ARC signing
+    // FIXED: normalise before setting state
+    setPlayerPrivateKey(normalisePrivateKey(acc.privateKey));
     if (savedName) setPlayerName(savedName);
   }, []);
 
@@ -164,16 +198,18 @@ export default function App() {
           accountRef.current = makeAccount(savedKey as `0x${string}`);
         } else {
           accountRef.current = makeAccount();
-          localStorage.setItem("cp_private_key", accountRef.current.privateKey);
+          const cleanKey = normalisePrivateKey(accountRef.current.privateKey);
+          localStorage.setItem("cp_private_key", cleanKey);
         }
       } catch {
         localStorage.removeItem("cp_private_key");
         accountRef.current = makeAccount();
-        localStorage.setItem("cp_private_key", accountRef.current.privateKey);
+        const cleanKey = normalisePrivateKey(accountRef.current.privateKey);
+        localStorage.setItem("cp_private_key", cleanKey);
       }
       localStorage.setItem("cp_address", accountRef.current.address);
       setPlayerAddress(accountRef.current.address);
-      setPlayerPrivateKey(accountRef.current.privateKey);
+      setPlayerPrivateKey(normalisePrivateKey(accountRef.current.privateKey));
     }
     return accountRef.current;
   }
@@ -185,7 +221,6 @@ export default function App() {
     localStorage.setItem("cp_name", name);
   }
 
-  // V2: memberStake param added; registerCommunity on ARC after GenLayer success
   async function handleCreateCommunity(params: {
     founderName: string;
     communityName: string;
@@ -199,7 +234,7 @@ export default function App() {
     fundingThreshold: number;
     maxProposalPct: number;
     proposalFee: number;
-    memberStake: number;  // V2 NEW
+    memberStake: number;
   }) {
     setLoading("Creating community...");
     setError("");
@@ -227,7 +262,7 @@ export default function App() {
         params.fundingThreshold,
         params.maxProposalPct,
         params.proposalFee,
-        params.memberStake  // V2 NEW
+        params.memberStake
       );
 
       if (!communityId) {
@@ -236,9 +271,6 @@ export default function App() {
 
       setActiveCommunityId(communityId);
 
-      // V2: Register community on ARC escrow (relay wallet = pot address on testnet)
-      // Fire and forget — non-blocking. If this fails, slash won't work but
-      // release still works. Log the error so developer can retry manually.
       if (params.memberStake > 0) {
         try {
           const relayAddr = getRelayAddress();
@@ -246,8 +278,6 @@ export default function App() {
           console.log(`ARC community registered: ${communityId} → pot: ${relayAddr}`);
         } catch (arcErr: any) {
           console.error("ARC registerCommunity failed — slash will not work:", arcErr?.message);
-          // Do not throw — community is created on GenLayer, ARC registration
-          // can be retried manually by calling registerCommunity(communityId, relayAddr)
         }
       }
 
@@ -264,11 +294,10 @@ export default function App() {
     }
   }
 
-  // V2: receives arcTxHash from JoinCommunityScreen; clears localStorage on success
   async function handleJoinCommunity(
     communityId: string,
     name: string,
-    arcTxHash: string  // V2 NEW — ARC deposit proof
+    arcTxHash: string
   ) {
     setLoading("Joining community...");
     setError("");
@@ -286,7 +315,6 @@ export default function App() {
         throw new Error("Community not found");
       }
 
-      // V2: pass arcTxHash — GenLayer gate requires non-empty string
       await joinCommunity(
         acc,
         communityId.trim().toUpperCase(),
@@ -295,7 +323,6 @@ export default function App() {
         arcTxHash
       );
 
-      // V2: GenLayer confirmed — safe to clear the stored stake hash
       localStorage.removeItem(stakeKey);
 
       const updated = await getCommunity(communityId.trim().toUpperCase());
@@ -304,7 +331,6 @@ export default function App() {
       setScreen("community_dashboard");
     } catch (e: any) {
       console.error(e);
-      // Do NOT clear stakeKey here — the user may need to retry the GenLayer step
       setError(
         e.message === "Community not found"
           ? "Community not found. Check the ID and try again."
@@ -315,7 +341,6 @@ export default function App() {
     }
   }
 
-  // V2 NEW: leave community → release stake on ARC
   async function handleLeaveCommunity() {
     if (!activeCommunityId) return;
     setLoading("Leaving community...");
@@ -323,21 +348,16 @@ export default function App() {
     const acc = getAccount();
 
     try {
-      // Step 1: GenLayer — remove from member list
       const success = await leaveCommunity(acc, activeCommunityId, acc.address);
       if (!success) {
         throw new Error("Leave failed on GenLayer — you may be the founder, or already not a member.");
       }
 
-      // Step 2: ARC — release stake back to member
-      // Only fires after GenLayer confirms. Never fires on GenLayer failure.
       try {
         await releaseStake(activeCommunityId, acc.address);
         console.log(`ARC stake released for ${acc.address} in ${activeCommunityId}`);
       } catch (arcErr: any) {
         console.error("ARC releaseStake failed:", arcErr?.message);
-        // Member is removed from GenLayer but stake not released.
-        // This means the relay wallet may be dry. Show a specific error.
         throw new Error(
           "Left the community on GenLayer but stake release on ARC failed. " +
           "The relay wallet may be low on USDC. Contact the community founder."
@@ -353,7 +373,6 @@ export default function App() {
     }
   }
 
-  // V2 NEW: slash member → slash stake on ARC
   async function handleSlashMember(targetAddress: string) {
     if (!activeCommunityId) return;
     setLoading("Slashing member...");
@@ -361,7 +380,6 @@ export default function App() {
     const acc = getAccount();
 
     try {
-      // Step 1: GenLayer — remove member, record slash
       const success = await slashMember(
         acc,
         activeCommunityId,
@@ -372,8 +390,6 @@ export default function App() {
         throw new Error("Slash failed on GenLayer — check you are the founder.");
       }
 
-      // Step 2: ARC — send stake to community pot (relay wallet)
-      // Only fires after GenLayer confirms.
       try {
         await slashStake(activeCommunityId, targetAddress);
         console.log(`ARC stake slashed for ${targetAddress} in ${activeCommunityId}`);
@@ -385,7 +401,6 @@ export default function App() {
         );
       }
 
-      // Refresh community to reflect new member count
       const updated = await getCommunity(activeCommunityId);
       setCommunity(updated);
     } catch (e: any) {
@@ -627,9 +642,9 @@ export default function App() {
         return (
           <JoinCommunityScreen
             playerAddress={playerAddress}
-            playerPrivateKey={playerPrivateKey}  // V2 NEW
+            playerPrivateKey={playerPrivateKey}
             playerName={playerName}
-            onJoin={handleJoinCommunity}          // V2: now (id, name, arcTxHash) => void
+            onJoin={handleJoinCommunity}
             onBack={() => setScreen("landing")}
             loading={loading}
             error={error}
@@ -644,8 +659,8 @@ export default function App() {
             playerAddress={playerAddress}
             onNavigate={setScreen}
             onBack={handleNavigateToLanding}
-            onSlashMember={handleSlashMember}       // V2 NEW
-            onLeaveCommunity={handleLeaveCommunity} // V2 NEW
+            onSlashMember={handleSlashMember}
+            onLeaveCommunity={handleLeaveCommunity}
             loading={loading}
             error={error}
           />

@@ -1,25 +1,15 @@
 "use client";
 // CommunityPulse V2 — Join Community Screen
-// V2 Changes: two-step ARC stake flow with localStorage retry pattern.
-//
-// Flow:
-//   1. Look up community (unchanged from V1)
-//   2. Show stake requirement
-//   3. Check community status before touching ARC (guard against depleted/paused)
-//   4. Approve USDC on ARC
-//   5. depositStake on ARC → store tx hash in localStorage IMMEDIATELY
-//   6. join_community on GenLayer with hash as proof
-//   7. On success: clear localStorage key, navigate to dashboard
-//   8. On GenLayer failure: show "Retry Join" — re-attempts step 6 with stored hash
+// Fix: live USDC balance check with funding prompt before stake button is enabled
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Community } from "../types";
 import { getCommunity } from "../lib/contract";
-import { approveUsdc, depositStake } from "../lib/arcContract";
+import { approveUsdc, depositStake, getUsdcBalance } from "../lib/arcContract";
 
 interface JoinCommunityProps {
   playerAddress: string;
-  playerPrivateKey: string;      // V2 NEW — needed for ARC sign
+  playerPrivateKey: string;
   playerName: string;
   onJoin: (communityId: string, name: string, arcTxHash: string) => void;
   onBack: () => void;
@@ -49,10 +39,28 @@ export default function JoinCommunityScreen({
   const [stepError, setStepError] = useState("");
   const [canRetry, setCanRetry] = useState(false);
 
+  // V2 Fix: live balance check
+  const [walletBalance, setWalletBalance] = useState<number | null>(null);
+  const [balanceLoading, setBalanceLoading] = useState(false);
+
   const isLoading = !!loading || stepState !== "idle";
+  const hasStake = (foundCommunity?.member_stake ?? 0) > 0;
+  const hasEnoughBalance =
+    !hasStake ||
+    walletBalance === null ||
+    walletBalance >= (foundCommunity?.member_stake ?? 0);
+
+  // Load balance when a staked community is found
+  useEffect(() => {
+    if (!foundCommunity || !hasStake || !playerAddress) return;
+    setBalanceLoading(true);
+    getUsdcBalance(playerAddress)
+      .then(setWalletBalance)
+      .catch(() => setWalletBalance(null))
+      .finally(() => setBalanceLoading(false));
+  }, [foundCommunity, hasStake, playerAddress]);
 
   // ── Lookup ─────────────────────────────────────────────────────────────────
-
   async function handleLookup() {
     const trimmed = communityId.trim().toUpperCase();
     if (!trimmed) return;
@@ -63,6 +71,7 @@ export default function JoinCommunityScreen({
     setStepState("idle");
     setStepError("");
     setCanRetry(false);
+    setWalletBalance(null);
 
     try {
       const data = await getCommunity(trimmed);
@@ -80,28 +89,22 @@ export default function JoinCommunityScreen({
   }
 
   // ── Join with stake ────────────────────────────────────────────────────────
-
   async function handleJoinWithStake() {
     if (!foundCommunity || !nameInput.trim()) return;
 
-    // Guard: check community is still active before touching ARC.
-    // A community could become depleted between lookup and join click.
     if (foundCommunity.status !== "active") {
       setStepError("This community is no longer active. Cannot join.");
       return;
     }
 
     const stakeKey = `cp_pending_stake_${foundCommunity.id}_${playerAddress}`;
-
     setStepError("");
     setCanRetry(false);
 
     try {
-      // ── Step 1: ARC deposit (skip if already stored from a previous failed attempt) ──
       let arcTxHash = localStorage.getItem(stakeKey);
 
       if (!arcTxHash) {
-        // Fresh join — need to approve then deposit
         if (foundCommunity.member_stake > 0) {
           setStepState("approving");
           await approveUsdc(playerPrivateKey, foundCommunity.member_stake);
@@ -114,29 +117,20 @@ export default function JoinCommunityScreen({
             foundCommunity.member_stake
           );
 
-          // Store IMMEDIATELY — before the GenLayer call.
-          // If GenLayer fails, the hash is here for retry.
           localStorage.setItem(stakeKey, arcTxHash);
         } else {
-          // Zero stake community — use a placeholder hash.
-          // GenLayer gate checks non-empty, any string passes.
           arcTxHash = "FREE_JOIN";
         }
       }
-      // If arcTxHash was already in localStorage (retry path), skip ARC entirely.
 
-      // ── Step 2: GenLayer join ──
       setStepState("joining");
       onJoin(foundCommunity.id, nameInput.trim(), arcTxHash);
-      // App.tsx handler calls joinCommunity and navigates on success.
-      // On success, App.tsx must also call localStorage.removeItem(stakeKey).
 
     } catch (err: any) {
       console.error("handleJoinWithStake failed:", err?.message, err);
 
       const storedHash = localStorage.getItem(stakeKey);
       if (storedHash) {
-        // ARC succeeded but we hit an error before GenLayer (network blip, etc.)
         setStepError(
           "Stake deposited on ARC but joining GenLayer failed. " +
           "Your USDC is safe in escrow. Click Retry Join to complete."
@@ -145,7 +139,7 @@ export default function JoinCommunityScreen({
       } else {
         setStepError(
           err?.message?.includes("user rejected")
-            ? "Transaction cancelled in wallet."
+            ? "Transaction cancelled."
             : "Failed to deposit stake. Check your USDC balance and try again."
         );
       }
@@ -162,13 +156,10 @@ export default function JoinCommunityScreen({
       setCanRetry(false);
       return;
     }
-
     setStepState("retrying");
     setStepError("");
     onJoin(foundCommunity.id, nameInput.trim(), arcTxHash);
   }
-
-  // ── Step label ─────────────────────────────────────────────────────────────
 
   function getStepLabel(): string {
     switch (stepState) {
@@ -180,6 +171,10 @@ export default function JoinCommunityScreen({
     }
   }
 
+  function copyAddress() {
+    navigator.clipboard.writeText(playerAddress);
+  }
+
   const constitutionTags = foundCommunity
     ? [
         { label: "Purpose",     value: foundCommunity.constitution.purpose },
@@ -188,7 +183,14 @@ export default function JoinCommunityScreen({
       ]
     : [];
 
-  const hasStake = (foundCommunity?.member_stake ?? 0) > 0;
+  const shortAddress = playerAddress
+    ? playerAddress.slice(0, 6) + "..." + playerAddress.slice(-4)
+    : "";
+
+  const needsFunding =
+    hasStake &&
+    walletBalance !== null &&
+    walletBalance < (foundCommunity?.member_stake ?? 0);
 
   return (
     <div className="screen fadeIn">
@@ -202,7 +204,6 @@ export default function JoinCommunityScreen({
       {/* ── Lookup form ── */}
       <div className="form-section">
         <div className="form-section-title">Find Community</div>
-
         <div style={{ display: "flex", gap: "10px" }}>
           <input
             type="text"
@@ -212,6 +213,7 @@ export default function JoinCommunityScreen({
               setCommunityId(e.target.value.toUpperCase());
               setLookupState("idle");
               setFoundCommunity(null);
+              setWalletBalance(null);
             }}
             onKeyDown={(e) => e.key === "Enter" && handleLookup()}
             maxLength={9}
@@ -225,22 +227,15 @@ export default function JoinCommunityScreen({
           >
             {lookupState === "loading" ? (
               <span className="btn-loading"><span className="spinner" />Looking up...</span>
-            ) : (
-              "Look Up"
-            )}
+            ) : "Look Up"}
           </button>
         </div>
-
         {lookupError && <p className="error-text">{lookupError}</p>}
       </div>
 
       {/* ── Community preview ── */}
       {lookupState === "found" && foundCommunity && (
-        <div
-          className="card card--green fadeIn"
-          style={{ display: "flex", flexDirection: "column", gap: "14px" }}
-        >
-          {/* Header */}
+        <div className="card card--green fadeIn" style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
           <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: "12px" }}>
             <div>
               <div style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: "1.6rem", letterSpacing: "0.04em", color: "#F0F0F0", lineHeight: 1.1 }}>
@@ -255,7 +250,6 @@ export default function JoinCommunityScreen({
             </span>
           </div>
 
-          {/* Stats */}
           <div style={{ display: "flex", gap: "16px", flexWrap: "wrap" }}>
             {[
               ["👥", foundCommunity.member_count, "members"],
@@ -264,70 +258,51 @@ export default function JoinCommunityScreen({
               ["🎯", `${foundCommunity.funding_threshold}/100`, "threshold"],
             ].map(([icon, val, lbl]) => (
               <div key={String(lbl)} style={{ display: "flex", flexDirection: "column", gap: "2px" }}>
-                <div style={{ fontSize: "13px", color: "#F0F0F0", fontWeight: 600 }}>
-                  {icon} {val}
-                </div>
-                <div style={{ fontSize: "11px", color: "#555566", textTransform: "uppercase", letterSpacing: "0.06em" }}>
-                  {lbl}
-                </div>
+                <div style={{ fontSize: "13px", color: "#F0F0F0", fontWeight: 600 }}>{icon} {val}</div>
+                <div style={{ fontSize: "11px", color: "#555566", textTransform: "uppercase", letterSpacing: "0.06em" }}>{lbl}</div>
               </div>
             ))}
           </div>
 
-          {/* V2: Stake requirement */}
-          <div
-            style={{
-              padding: "12px 14px",
-              background: hasStake
-                ? "rgba(167,139,250,0.08)"
-                : "rgba(255,255,255,0.02)",
-              border: `1px solid ${hasStake ? "rgba(167,139,250,0.25)" : "rgba(255,255,255,0.06)"}`,
-              borderRadius: "10px",
-            }}
-          >
+          {/* Stake requirement */}
+          <div style={{
+            padding: "12px 14px",
+            background: hasStake ? "rgba(167,139,250,0.08)" : "rgba(255,255,255,0.02)",
+            border: `1px solid ${hasStake ? "rgba(167,139,250,0.25)" : "rgba(255,255,255,0.06)"}`,
+            borderRadius: "10px",
+          }}>
             {hasStake ? (
               <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
                 <div style={{ fontSize: "13px", fontWeight: 700, color: "#A78BFA" }}>
                   🔒 {foundCommunity.member_stake} USDC stake required to join
                 </div>
                 <div style={{ fontSize: "12px", color: "#888899", lineHeight: 1.5 }}>
-                  Your stake is held in escrow on ARC testnet. It is returned if you leave cleanly.
-                  It is forfeited if the founder removes you for misconduct.
-                </div>
-                <div style={{ fontSize: "11px", color: "#555566", lineHeight: 1.4 }}>
-                  Need USDC? Faucet: <span style={{ color: "#00D4FF" }}>faucet.circle.com</span> → Arc Testnet → USDC
+                  Your stake is held in escrow on ARC testnet. Returned on clean exit, forfeited if slashed.
                 </div>
               </div>
             ) : (
-              <div style={{ fontSize: "13px", color: "#888899" }}>
-                ✓ Free to join — no USDC stake required.
-              </div>
+              <div style={{ fontSize: "13px", color: "#888899" }}>✓ Free to join — no USDC stake required.</div>
             )}
           </div>
 
           {/* Constitution peek */}
           <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-            <div style={{ fontSize: "11px", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", color: "#888899" }}>
-              Constitution
-            </div>
+            <div style={{ fontSize: "11px", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", color: "#888899" }}>Constitution</div>
             {constitutionTags.map(({ label, value }) => (
               <div key={label} style={{ fontSize: "13px", color: "#888899", lineHeight: 1.5 }}>
-                <span style={{ color: "#00D4FF", fontWeight: 700, fontSize: "11px", textTransform: "uppercase", letterSpacing: "0.06em" }}>
-                  {label}:{" "}
-                </span>
+                <span style={{ color: "#00D4FF", fontWeight: 700, fontSize: "11px", textTransform: "uppercase", letterSpacing: "0.06em" }}>{label}: </span>
                 {value}
               </div>
             ))}
           </div>
 
-          {/* Founder */}
           <div style={{ fontSize: "12px", color: "#555566" }}>
             Founded by <strong style={{ color: "#888899" }}>{foundCommunity.founder_name}</strong>
           </div>
         </div>
       )}
 
-      {/* ── Join form — shown once community found ── */}
+      {/* ── Join form ── */}
       {lookupState === "found" && foundCommunity && (
         <div className="form-section fadeIn">
           <div className="form-section-title">Join as</div>
@@ -344,37 +319,132 @@ export default function JoinCommunityScreen({
             />
           </div>
 
-          {/* Depleted warning */}
-          {foundCommunity.status === "depleted" && (
-            <div
-              style={{
-                padding: "12px 14px",
-                background: "rgba(255,77,109,0.06)",
-                border: "1px solid rgba(255,77,109,0.2)",
-                borderRadius: "12px",
-                fontSize: "13px",
-                color: "#FF4D6D",
-                lineHeight: 1.5,
-              }}
-            >
-              ⚠️ This community's pot is depleted. You can join and propose once funds are deposited.
-              {hasStake && " Note: your USDC stake would be locked even while the pot is empty."}
+          {/* ── WALLET FUNDING SECTION — shown when stake > 0 ── */}
+          {hasStake && (
+            <div style={{
+              padding: "14px 16px",
+              background: "rgba(0,212,255,0.04)",
+              border: "1px solid rgba(0,212,255,0.15)",
+              borderRadius: "12px",
+              display: "flex",
+              flexDirection: "column",
+              gap: "10px",
+            }}>
+              <div style={{ fontSize: "11px", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", color: "#00D4FF" }}>
+                Your Wallet
+              </div>
+
+              {/* Address row */}
+              <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#00FF87", flexShrink: 0 }} />
+                <span style={{ fontFamily: "monospace", fontSize: "12px", color: "#888899", flex: 1, overflow: "hidden", textOverflow: "ellipsis" }}>
+                  {playerAddress}
+                </span>
+                <button
+                  onClick={copyAddress}
+                  style={{ fontSize: "11px", color: "#00D4FF", border: "1px solid rgba(0,212,255,0.2)", borderRadius: "6px", padding: "3px 8px", background: "none", cursor: "pointer", fontFamily: "Inter, sans-serif", flexShrink: 0 }}
+                >
+                  Copy
+                </button>
+              </div>
+
+              {/* Balance row */}
+              <div style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "13px" }}>
+                <span style={{ color: "#888899" }}>Balance:</span>
+                {balanceLoading ? (
+                  <span className="spinner" style={{ width: 12, height: 12 }} />
+                ) : walletBalance === null ? (
+                  <span style={{ color: "#555566" }}>—</span>
+                ) : (
+                  <span style={{
+                    fontWeight: 700,
+                    color: walletBalance >= foundCommunity.member_stake ? "#00FF87" : "#FF4D6D",
+                  }}>
+                    {walletBalance.toFixed(2)} USDC
+                  </span>
+                )}
+                <span style={{ color: "#555566", fontSize: "11px" }}>on ARC Testnet</span>
+              </div>
+
+              {/* Funding prompt — only shown when balance is too low */}
+              {needsFunding && (
+                <div style={{
+                  padding: "12px 14px",
+                  background: "rgba(255,77,109,0.06)",
+                  border: "1px solid rgba(255,77,109,0.2)",
+                  borderRadius: "10px",
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "8px",
+                }}>
+                  <div style={{ fontSize: "13px", fontWeight: 700, color: "#FF4D6D" }}>
+                    ⚠️ You need at least {foundCommunity.member_stake} USDC to join
+                  </div>
+                  <div style={{ fontSize: "12px", color: "#888899", lineHeight: 1.6 }}>
+                    Your wallet currently has <strong style={{ color: "#FF4D6D" }}>{walletBalance?.toFixed(2)} USDC</strong>.
+                    You need <strong style={{ color: "#F0F0F0" }}>{foundCommunity.member_stake} USDC</strong> to stake.
+                  </div>
+                  <div style={{ fontSize: "12px", color: "#888899", lineHeight: 1.7 }}>
+                    <strong style={{ color: "#00D4FF" }}>How to get testnet USDC:</strong><br />
+                    1. Go to{" "}
+                    <a
+                      href="https://faucet.circle.com"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={{ color: "#00D4FF", textDecoration: "underline" }}
+                    >
+                      faucet.circle.com
+                    </a>
+                    <br />
+                    2. Select <strong style={{ color: "#F0F0F0" }}>Arc Testnet</strong> as the network<br />
+                    3. Paste your wallet address: <strong style={{ color: "#F0F0F0", fontFamily: "monospace", fontSize: "11px" }}>{shortAddress}</strong>{" "}
+                    <button
+                      onClick={copyAddress}
+                      style={{ fontSize: "10px", color: "#00D4FF", border: "1px solid rgba(0,212,255,0.2)", borderRadius: "4px", padding: "1px 6px", background: "none", cursor: "pointer", fontFamily: "Inter, sans-serif" }}
+                    >
+                      Copy
+                    </button>
+                    <br />
+                    4. Click <strong style={{ color: "#F0F0F0" }}>Request</strong> — you'll receive free testnet USDC<br />
+                    5. Come back here and click Join
+                  </div>
+                  <button
+                    className="btn-outline"
+                    onClick={() => {
+                      setBalanceLoading(true);
+                      getUsdcBalance(playerAddress)
+                        .then(setWalletBalance)
+                        .catch(() => setWalletBalance(null))
+                        .finally(() => setBalanceLoading(false));
+                    }}
+                    style={{ borderColor: "rgba(0,212,255,0.3)", color: "#00D4FF", marginTop: "4px" }}
+                  >
+                    {balanceLoading ? (
+                      <span className="btn-loading"><span className="spinner" />Checking...</span>
+                    ) : "🔄 Refresh Balance"}
+                  </button>
+                </div>
+              )}
+
+              {/* Success — enough balance */}
+              {!needsFunding && walletBalance !== null && walletBalance >= foundCommunity.member_stake && (
+                <div style={{ fontSize: "12px", color: "#00FF87", fontWeight: 600 }}>
+                  ✓ Sufficient balance — ready to stake
+                </div>
+              )}
             </div>
           )}
 
-          {/* V2: Step indicators when active */}
+          {/* Depleted warning */}
+          {foundCommunity.status === "depleted" && (
+            <div style={{ padding: "12px 14px", background: "rgba(255,77,109,0.06)", border: "1px solid rgba(255,77,109,0.2)", borderRadius: "12px", fontSize: "13px", color: "#FF4D6D", lineHeight: 1.5 }}>
+              ⚠️ This community's pot is depleted. You can join but proposals can't be funded until the pot is topped up.
+            </div>
+          )}
+
+          {/* Step indicators */}
           {stepState !== "idle" && (
-            <div
-              style={{
-                padding: "12px 14px",
-                background: "rgba(0,212,255,0.05)",
-                border: "1px solid rgba(0,212,255,0.2)",
-                borderRadius: "12px",
-                display: "flex",
-                flexDirection: "column",
-                gap: "8px",
-              }}
-            >
+            <div style={{ padding: "12px 14px", background: "rgba(0,212,255,0.05)", border: "1px solid rgba(0,212,255,0.2)", borderRadius: "12px", display: "flex", flexDirection: "column", gap: "8px" }}>
               {hasStake && (
                 <>
                   <div style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "13px" }}>
@@ -404,12 +474,8 @@ export default function JoinCommunityScreen({
             </div>
           )}
 
-          {/* Errors */}
-          {(stepError || error) && (
-            <p className="error-text">{stepError || error}</p>
-          )}
+          {(stepError || error) && <p className="error-text">{stepError || error}</p>}
 
-          {/* Retry button */}
           {canRetry && (
             <button
               className="btn-outline"
@@ -419,18 +485,20 @@ export default function JoinCommunityScreen({
             >
               {stepState === "retrying" ? (
                 <span className="btn-loading"><span className="spinner" />Retrying...</span>
-              ) : (
-                "🔄 Retry Join (stake already deposited)"
-              )}
+              ) : "🔄 Retry Join (stake already deposited)"}
             </button>
           )}
 
-          {/* Main join button — hidden when retry is available */}
           {!canRetry && (
             <button
               className="btn-primary"
               onClick={handleJoinWithStake}
-              disabled={!nameInput.trim() || isLoading || foundCommunity.status !== "active"}
+              disabled={
+                !nameInput.trim() ||
+                isLoading ||
+                foundCommunity.status !== "active" ||
+                needsFunding
+              }
             >
               {isLoading ? (
                 <span className="btn-loading">
@@ -444,24 +512,19 @@ export default function JoinCommunityScreen({
               )}
             </button>
           )}
+
+          {needsFunding && (
+            <p style={{ fontSize: "12px", color: "#555566", textAlign: "center", lineHeight: 1.5 }}>
+              The Join button will unlock once your wallet has enough USDC.
+            </p>
+          )}
         </div>
       )}
 
       {/* ── Tip ── */}
-      <div
-        style={{
-          padding: "14px 16px",
-          background: "rgba(255,255,255,0.02)",
-          border: "1px solid rgba(255,255,255,0.06)",
-          borderRadius: "12px",
-          fontSize: "13px",
-          color: "#555566",
-          lineHeight: 1.6,
-        }}
-      >
+      <div style={{ padding: "14px 16px", background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: "12px", fontSize: "13px", color: "#555566", lineHeight: 1.6 }}>
         <strong style={{ color: "#888899" }}>Tip:</strong> Ask the community founder for the ID — it looks like{" "}
         <span style={{ fontFamily: "'Bebas Neue', sans-serif", letterSpacing: "0.08em", color: "#F0F0F0" }}>COM000001</span>.
-        {hasStake && " Make sure your wallet has enough USDC before joining."}
       </div>
     </div>
   );
